@@ -3,6 +3,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ts from 'typescript';
 
 const TEST_OR_FIXTURE_RE = /(^|;|\s+|\/\/|\/\*)fixture\s*(\(.+?\)|`.+?`)|(^|;|\s+|\/\/|\/\*)test\s*\(\s*(.+?)\s*,/gm;
 const CLEANUP_TEST_OR_FIXTURE_NAME_RE = /(^\(?\s*(\'|"|`))|((\'|"|`)\s*\)?$)/g;
@@ -170,12 +171,72 @@ class TestCafeTestController {
         if(!selection || !selection.active)
             return;
 
+        // TODO This doesn't seem to be completely accurate (off by a few characters at times?). See if it can be improved
         var cursorPosition = document.getText(new vscode.Range(0, 0, selection.active.line, selection.active.character)).length;
+
+        let fileName = doc.fileName;
+        const source = fs.readFileSync(fileName, 'utf-8');
+        const ast = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+
         var textBeforeSelection = document.getText(new vscode.Range(0, 0, selection.end.line + 1, 0));
 
-        var [type, name] = this.findTestOrFixtureName(textBeforeSelection, cursorPosition);
+        var [type, name] = this.findTestOrFixture(ast, cursorPosition);
 
         this.startTestRun(browser, document.fileName, type, name);
+    }
+
+    private findTestOrFixture(file: ts.SourceFile, cursorPosition: number) {
+        const tests = file.statements.map(node => this.findTest(node, cursorPosition))
+            .filter(match => match !== undefined);
+        if (tests.length > 0) {
+            return tests[0];
+        }
+
+        const fixtures = file.statements.map(node => this.findFixture(node))
+            .filter(match => match !== undefined);
+        if (fixtures.length > 0) {
+            return fixtures[0];
+        }
+    }
+
+    private findTest(node: ts.Node, cursorPosition: number) {
+        if (ts.isExpressionStatement(node)
+            && this.isTestBlock(node)
+            && node.pos <= cursorPosition && node.end >= cursorPosition) {
+            const expr = node.expression as ts.CallExpression;
+            // Our current node is a "test" block. Find the string literal argument
+            if (expr.arguments && expr.arguments.length > 0 && ts.isStringLiteral(expr.arguments[0])) {
+                const testName = (expr.arguments[0] as ts.StringLiteral).text;
+                return ["test", testName];
+            }
+        }
+    }
+
+    private findFixture(node: ts.Node) {
+        if (ts.isExpressionStatement(node)) {
+            const fixture = this.getFixtureBlock(node);
+            if (!!fixture) {
+                const parent = fixture.parent as ts.CallExpression;
+                const name = (parent.arguments[0] as ts.StringLiteral).text;
+                return ["fixture", name];
+            }
+        }
+    }
+
+    private isTestBlock(node: ts.Node): boolean {
+        if (node.kind === ts.SyntaxKind.Identifier && node.getText() === "test") {
+            return true;
+        }
+
+        return node.forEachChild(child => this.isTestBlock(child));
+    }
+
+    private getFixtureBlock(node: ts.Node) {
+        if (ts.isIdentifier(node) && node.getText() === "fixture") {
+            return node;
+        }
+
+        return node.forEachChild(child => this.getFixtureBlock(child));
     }
 
     public repeatLastRun() {
@@ -189,11 +250,11 @@ class TestCafeTestController {
 
     private cropMatchString(matchString){
         matchString = matchString.trim().replace(/;|\/\/|\/\*/, '');
-        
+
         return matchString.trim();
     }
 
-    private isTest(matchString){    
+    private isTest(matchString){
         return this.cropMatchString(matchString).indexOf('test') === 0;
     }
 
@@ -231,7 +292,7 @@ class TestCafeTestController {
 
         return ['', ''];
     }
-    
+
     private getOverriddenWorkspacePath(): string {
         const alternateWorkspacePath = vscode.workspace.getConfiguration('testcafeTestRunner').get('workspaceRoot')
         if (typeof(alternateWorkspacePath) === 'string' && alternateWorkspacePath.length > 0 ){
@@ -269,7 +330,7 @@ class TestCafeTestController {
             vscode.window.showErrorMessage(`TestCafe package is not found at path ${testCafePath}. Install the testcafe package in your working directory or set the "testcafeTestRunner.workspaceRoot" property.`);
             return;
         }
-        
+
         var workingDirectory = path.resolve(vscode.workspace.rootPath, workspacePathOverride);
         var wsFolder = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0] : undefined;
         vscode.debug.startDebugging(wsFolder, {
